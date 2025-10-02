@@ -77,7 +77,9 @@ async def safe_search_messages(bot, **kwargs):
     """Safe message search with retry logic"""
     for attempt in range(5):
         try:
-            return bot.search_messages(**kwargs)
+            # Yeh directly search_messages ka async generator return karega
+            async for message in bot.search_messages(**kwargs):
+                yield message
         except FloodWait as e:
             await asyncio.sleep(e.x)
         except Exception as e:
@@ -85,6 +87,22 @@ async def safe_search_messages(bot, **kwargs):
             if attempt == 4:
                 raise e
             await asyncio.sleep(2 ** attempt)
+
+# ALTERNATIVE SIMPLER APPROACH - Recommended
+async def simple_safe_search(bot, **kwargs):
+    """Simplified version without complex retry logic"""
+    try:
+        async for message in bot.search_messages(**kwargs):
+            yield message
+    except FloodWait as e:
+        await asyncio.sleep(e.x)
+        # Retry once after flood wait
+        async for message in bot.search_messages(**kwargs):
+            yield message
+    except Exception as e:
+        print(f"Search failed: {e}")
+        # Empty generator return karega agar error hai
+        return
 
 @Client.on_message(filters.command("unequify") & filters.private)
 async def unequify(client, message):
@@ -188,7 +206,8 @@ async def unequify(client, message):
         try:
             await sts.edit(Script.DUPLICATE_TEXT.format(total, deleted, "🔄 Progressing..."), reply_markup=CANCEL_BTN)
             
-            async for message_obj in safe_search_messages(bot, chat_id=chat_id, filter=enums.MessagesFilter.DOCUMENT):
+            # CORRECTED LINE - await ke saath
+            async for message_obj in simple_safe_search(bot, chat_id=chat_id, filter=enums.MessagesFilter.DOCUMENT):
                 if temp.CANCEL.get(user_id):
                     await sts.edit(Script.DUPLICATE_TEXT.format(total, deleted, "🚫 Cancelled"), reply_markup=COMPLETED_BTN)
                     break
