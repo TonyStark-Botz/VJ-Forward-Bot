@@ -2,11 +2,11 @@
 #     💜 𝗖𝗛𝗔𝗡𝗡𝗘𝗟𝗦 𝗙𝗢𝗥 𝗨𝗣𝗗𝗔𝗧𝗘𝗦 💜
 #     Tᘜ Oᗯᑎᗴᖇ : https://t.me/TonyStark_Botz
 #     Tᘜ ᑕOᗰᗰᑌᑎITY : https://t.me/Kanus_Network
-#     ᘜITᕼᑌᗷ Iᗪ : https://github.com/TonyStark-Botz
+#     ᘜITᕼᑌᗻ Iᗪ : https://github.com/TonyStark-Botz
 #     BY : Kᴀɴᴜs Nᴇᴛᴡᴏʀᴋ™
 #     ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
 
-import re, asyncio, time
+import re, asyncio
 from database import Db, db
 from config import temp
 from .test import CLIENT, get_client
@@ -18,7 +18,7 @@ from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 import struct
 from pyrogram.errors import (
     FloodWait, RPCError, ChannelInvalid, ChatAdminRequired,
-    MessageDeleteForbidden, ConnectionError, SessionPasswordNeeded
+    MessageDeleteForbidden, SessionPasswordNeeded
 )
 
 CLIENT = CLIENT()
@@ -64,16 +64,13 @@ async def safe_delete_messages(bot, chat_id, message_ids, max_retries=3):
         except MessageDeleteForbidden:
             print("No permission to delete messages")
             return False
-        except (ConnectionError, BrokenPipeError) as e:
-            if attempt == max_retries - 1:
-                print(f"Failed to delete after {max_retries} attempts: {e}")
-                return False
-            await asyncio.sleep(2 ** attempt)  # Exponential backoff
         except FloodWait as e:
             await asyncio.sleep(e.x)
         except Exception as e:
-            print(f"Unexpected error deleting messages: {e}")
-            return False
+            print(f"Error deleting messages (attempt {attempt + 1}): {e}")
+            if attempt == max_retries - 1:
+                return False
+            await asyncio.sleep(2 ** attempt)  # Exponential backoff
     return False
 
 async def safe_search_messages(bot, **kwargs):
@@ -81,12 +78,13 @@ async def safe_search_messages(bot, **kwargs):
     for attempt in range(5):
         try:
             return bot.search_messages(**kwargs)
-        except (ConnectionError, BrokenPipeError) as e:
+        except FloodWait as e:
+            await asyncio.sleep(e.x)
+        except Exception as e:
+            print(f"Search error (attempt {attempt + 1}): {e}")
             if attempt == 4:
                 raise e
             await asyncio.sleep(2 ** attempt)
-        except FloodWait as e:
-            await asyncio.sleep(e.x)
 
 @Client.on_message(filters.command("unequify") & filters.private)
 async def unequify(client, message):
@@ -243,3 +241,11 @@ async def unequify(client, message):
     except Exception as e:
         temp.lock[user_id] = False
         await message.reply(f"**❌ Unexpected error:** `{e}`")
+
+#     ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
+#     💜 𝗖𝗛𝗔𝗡𝗡𝗘𝗟𝗦 𝗙𝗢𝗥 𝗨𝗣𝗗𝗔𝗧𝗘𝗦 💜
+#     Tᘜ Oᗯᑎᗴᖇ : https://t.me/TonyStark_Botz
+#     Tᘜ ᑕOᗰᗰᑌᑎITY : https://t.me/Kanus_Network
+#     ᘜITᕼᑌᗻ Iᗪ : https://github.com/TonyStark-Botz
+#     BY : Kᴀɴᴜs Nᴇᴛᴡᴏʀᴋ™
+#     ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
