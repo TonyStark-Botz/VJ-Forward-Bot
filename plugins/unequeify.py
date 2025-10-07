@@ -6,7 +6,7 @@
 #     BY : Kᴀɴᴜs Nᴇᴛᴡᴏʀᴋ™
 #     ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
 
-import re, asyncio
+import re, asyncio, time
 from database import Db, db
 from config import temp
 from .test import CLIENT, get_client
@@ -20,6 +20,7 @@ from pyrogram.errors import (
     FloodWait, RPCError, ChannelInvalid, ChatAdminRequired,
     MessageDeleteForbidden, SessionPasswordNeeded
 )
+from datetime import datetime
 
 CLIENT = CLIENT()
 COMPLETED_BTN = InlineKeyboardMarkup([
@@ -70,14 +71,13 @@ async def safe_delete_messages(bot, chat_id, message_ids, max_retries=3):
             print(f"Error deleting messages (attempt {attempt + 1}): {e}")
             if attempt == max_retries - 1:
                 return False
-            await asyncio.sleep(2 ** attempt)  # Exponential backoff
+            await asyncio.sleep(2 ** attempt)
     return False
 
 async def safe_search_messages(bot, **kwargs):
     """Safe message search with retry logic"""
     for attempt in range(5):
         try:
-            # Yeh directly search_messages ka async generator return karega
             async for message in bot.search_messages(**kwargs):
                 yield message
         except FloodWait as e:
@@ -88,7 +88,6 @@ async def safe_search_messages(bot, **kwargs):
                 raise e
             await asyncio.sleep(2 ** attempt)
 
-# ALTERNATIVE SIMPLER APPROACH - Recommended
 async def simple_safe_search(bot, **kwargs):
     """Simplified version without complex retry logic"""
     try:
@@ -96,23 +95,51 @@ async def simple_safe_search(bot, **kwargs):
             yield message
     except FloodWait as e:
         await asyncio.sleep(e.x)
-        # Retry once after flood wait
         async for message in bot.search_messages(**kwargs):
             yield message
     except Exception as e:
         print(f"Search failed: {e}")
-        # Empty generator return karega agar error hai
         return
+
+async def process_media_message(bot, user_id, chat_id, message):
+    """Extract file_id from different media types"""
+    file_id = None
+    media_type = None
+    
+    if message.document:
+        file_id = unpack_new_file_id(message.document.file_id)
+        media_type = "document"
+    elif message.photo:
+        file_id = unpack_new_file_id(message.photo.file_id)
+        media_type = "photo"
+    elif message.video:
+        file_id = unpack_new_file_id(message.video.file_id)
+        media_type = "video"
+    elif message.audio:
+        file_id = unpack_new_file_id(message.audio.file_id)
+        media_type = "audio"
+    elif message.voice:
+        file_id = unpack_new_file_id(message.voice.file_id)
+        media_type = "voice"
+    elif message.video_note:
+        file_id = unpack_new_file_id(message.video_note.file_id)
+        media_type = "video_note"
+    elif message.sticker:
+        file_id = unpack_new_file_id(message.sticker.file_id)
+        media_type = "sticker"
+    elif message.animation:
+        file_id = unpack_new_file_id(message.animation.file_id)
+        media_type = "animation"
+    
+    return file_id, media_type
 
 @Client.on_message(filters.command("unequify") & filters.private)
 async def unequify(client, message):
     user_id = message.from_user.id
     
-    # Check if previous task is running
     if temp.lock.get(user_id):
         return await message.reply("**❌ Please wait until previous task completes**")
     
-    # Check for userbot
     _bot = await db.get_userbot(user_id)
     if not _bot:
         return await message.reply("<b>❌ Need userbot to do this process. Please add a userbot using /settings</b>")
@@ -121,7 +148,6 @@ async def unequify(client, message):
     temp.lock[user_id] = True
     
     try:
-        # Get target chat info
         target = await client.ask(
             user_id, 
             text="**📩 Forward the last message from target chat or send last message link.**\n/cancel - `cancel this process`",
@@ -136,7 +162,6 @@ async def unequify(client, message):
         last_msg_id = None
         
         if target.text:
-            # Handle link parsing
             regex = re.compile("(https://)?(t\.me/|telegram\.me/|telegram\.dog/)(c/)?(\d+|[a-zA-Z_0-9]+)/(\d+)$")
             match = regex.match(target.text.replace("?single", ""))
             if not match:
@@ -155,7 +180,6 @@ async def unequify(client, message):
             temp.lock[user_id] = False
             return await message.reply_text("**❌ Invalid input!**")
         
-        # Confirmation
         confirm = await client.ask(
             user_id, 
             text="**⚠️ Send /yes to start the process or /no to cancel**",
@@ -166,9 +190,12 @@ async def unequify(client, message):
             temp.lock[user_id] = False
             return await confirm.reply("**🚫 Process cancelled!**")
         
-        sts = await confirm.reply("**🔄 Processing...**")
+        sts = await confirm.reply("**🔄 Initializing...**")
         
-        # Initialize userbot client
+        # Clear previous file_ids for this user and chat
+        await db.clear_user_file_ids(user_id, chat_id)
+        await sts.edit("**🗃️ Database cleared. Starting scan...**")
+        
         il = False
         data = _bot['session']
         bot = None
@@ -198,58 +225,84 @@ async def unequify(client, message):
             await bot.stop()
             return
         
-        # Main processing logic
-        MESSAGES = []
+        # Main processing with MongoDB
         DUPLICATE = []
-        total = deleted = 0
+        total = scanned = deleted = 0
+        start_time = time.time()
         
         try:
-            await sts.edit(Script.DUPLICATE_TEXT.format(total, deleted, "🔄 Progressing..."), reply_markup=CANCEL_BTN)
+            await sts.edit(Script.DUPLICATE_TEXT.format(total, deleted, "🔄 Starting scan..."), reply_markup=CANCEL_BTN)
             
-            # CORRECTED LINE - await ke saath
-            async for message_obj in simple_safe_search(bot, chat_id=chat_id, filter=enums.MessagesFilter.DOCUMENT):
+            # Process all media types, not just documents
+            async for message_obj in bot.get_chat_history(chat_id, limit=None):
                 if temp.CANCEL.get(user_id):
                     await sts.edit(Script.DUPLICATE_TEXT.format(total, deleted, "🚫 Cancelled"), reply_markup=COMPLETED_BTN)
                     break
                 
-                if not message_obj.document:
+                if not message_obj.media:
                     continue
                     
-                file = message_obj.document
-                file_id = unpack_new_file_id(file.file_id) 
+                file_id, media_type = await process_media_message(bot, user_id, chat_id, message_obj)
                 
-                if file_id in MESSAGES:
+                if not file_id:
+                    continue
+                
+                scanned += 1
+                
+                # Check if file_id exists in MongoDB
+                if await db.is_file_id_exist(user_id, chat_id, file_id):
                     DUPLICATE.append(message_obj.id)
+                    total += 1
                 else:
-                    MESSAGES.append(file_id)
-                
-                total += 1
+                    # Store new file_id in MongoDB
+                    await db.add_file_id(user_id, chat_id, file_id, message_obj.id)
+                    total += 1
                 
                 # Update progress every 100 messages
-                if total % 100 == 0:
-                    await sts.edit(Script.DUPLICATE_TEXT.format(total, deleted, "🔄 Progressing..."), reply_markup=CANCEL_BTN)
+                if scanned % 100 == 0:
+                    elapsed = time.time() - start_time
+                    speed = scanned / elapsed if elapsed > 0 else 0
+                    status_text = f"🔄 Scanned: {scanned}\nSpeed: {speed:.1f} msg/sec"
+                    await sts.edit(Script.DUPLICATE_TEXT.format(total, deleted, status_text), reply_markup=CANCEL_BTN)
                 
                 # Delete duplicates in batches of 50
                 if len(DUPLICATE) >= 50:
                     success = await safe_delete_messages(bot, chat_id, DUPLICATE)
                     if success:
                         deleted += len(DUPLICATE)
-                    await sts.edit(Script.DUPLICATE_TEXT.format(total, deleted, "🔄 Progressing..."), reply_markup=CANCEL_BTN)
+                    await sts.edit(Script.DUPLICATE_TEXT.format(total, deleted, f"🔄 Scanned: {scanned}"), reply_markup=CANCEL_BTN)
                     DUPLICATE = []
                     
         except Exception as e:
             await sts.edit(f"**❌ ERROR**\n`{e}`")
             
         finally:
-            # Final cleanup
+            # Final cleanup - delete remaining duplicates
             if DUPLICATE:
                 success = await safe_delete_messages(bot, chat_id, DUPLICATE)
                 if success:
                     deleted += len(DUPLICATE)
             
+            # Clear MongoDB after process completion
+            await db.clear_user_file_ids(user_id, chat_id)
+            
             temp.lock[user_id] = False
             status = "✅ Completed" if not temp.CANCEL.get(user_id) else "🚫 Cancelled"
-            await sts.edit(Script.DUPLICATE_TEXT.format(total, deleted, status), reply_markup=COMPLETED_BTN)
+            
+            final_text = f"""
+**♻️ Duplicate Removal Completed**
+
+📊 **Statistics:**
+├ Total Media Found: `{total}`
+├ Duplicates Removed: `{deleted}`
+└ Unique Files: `{total - deleted}`
+
+**Status:** {status}
+
+**Database cleared successfully! 🗑️**
+            """
+            
+            await sts.edit(final_text, reply_markup=COMPLETED_BTN)
             
             if bot:
                 await bot.stop()
