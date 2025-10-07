@@ -1,4 +1,13 @@
+#     ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
+#     💜 𝗖𝗛𝗔𝗡𝗡𝗘𝗟𝗦 𝗙𝗢𝗥 𝗨𝗣𝗗𝗔𝗧𝗘𝗦 💜
+#     Tᘜ Oᗯᑎᗴᖇ : https://t.me/TonyStark_Botz
+#     Tᘜ ᑕOᗰᗰᑌᑎITY : https://t.me/Kanus_Network
+#     ᘜITᕼᑌᗻ Iᗪ : https://github.com/TonyStark-Botz
+#     BY : Kᴀɴᴜs Nᴇᴛᴡᴏʀᴋ™
+#     ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
+
 import motor.motor_asyncio
+from datetime import datetime
 from config import Config
 
 class Db:
@@ -6,11 +15,16 @@ class Db:
     def __init__(self, uri, database_name):
         self._client = motor.motor_asyncio.AsyncIOMotorClient(uri)
         self.db = self._client[database_name]
+        
+        # Collections
         self.bot = self.db.bots
         self.userbot = self.db.userbot 
         self.col = self.db.users
         self.nfy = self.db.notify
         self.chl = self.db.channels 
+        
+        # New collection for file_id storage
+        self.file_ids = self.db.file_ids
 
     def new_user(self, id, name):
         return dict(
@@ -209,5 +223,189 @@ class Db:
    
     async def update_forward(self, user_id, details):
         await self.nfy.update_one({'user_id': user_id}, {'$set': {'details': details}})
+
+    # ============================
+    # FILE ID STORAGE METHODS
+    # ============================
+    
+    async def add_file_id(self, user_id, chat_id, file_id, message_id, media_type=None):
+        """Store file_id for duplicate checking"""
+        await self.file_ids.update_one(
+            {
+                'user_id': user_id, 
+                'chat_id': chat_id, 
+                'file_id': file_id
+            },
+            {
+                '$set': {
+                    'message_id': message_id, 
+                    'media_type': media_type,
+                    'timestamp': datetime.now()
+                }
+            },
+            upsert=True
+        )
+
+    async def is_file_id_exist(self, user_id, chat_id, file_id):
+        """Check if file_id exists for given user and chat"""
+        doc = await self.file_ids.find_one({
+            'user_id': user_id, 
+            'chat_id': chat_id, 
+            'file_id': file_id
+        })
+        return bool(doc)
+
+    async def get_file_id_count(self, user_id, chat_id=None):
+        """Get total file_ids stored for user (optionally for specific chat)"""
+        query = {'user_id': user_id}
+        if chat_id:
+            query['chat_id'] = chat_id
+        return await self.file_ids.count_documents(query)
+
+    async def clear_user_file_ids(self, user_id, chat_id=None):
+        """Clear file_ids for user (optionally for specific chat)"""
+        query = {'user_id': user_id}
+        if chat_id:
+            query['chat_id'] = chat_id
         
+        result = await self.file_ids.delete_many(query)
+        return result.deleted_count
+
+    async def get_all_file_ids(self, user_id, chat_id=None):
+        """Get all file_ids for user (optionally for specific chat)"""
+        query = {'user_id': user_id}
+        if chat_id:
+            query['chat_id'] = chat_id
+            
+        cursor = self.file_ids.find(query, {'file_id': 1, '_id': 0})
+        return [doc['file_id'] async for doc in cursor]
+
+    async def get_duplicate_message_ids(self, user_id, chat_id):
+        """Get message IDs of duplicate files"""
+        pipeline = [
+            {
+                '$match': {
+                    'user_id': user_id,
+                    'chat_id': chat_id
+                }
+            },
+            {
+                '$group': {
+                    '_id': '$file_id',
+                    'count': {'$sum': 1},
+                    'message_ids': {'$push': '$message_id'},
+                    'first_seen': {'$min': '$timestamp'}
+                }
+            },
+            {
+                '$match': {
+                    'count': {'$gt': 1}
+                }
+            },
+            {
+                '$project': {
+                    'file_id': '$_id',
+                    'duplicate_count': '$count',
+                    'message_ids': {
+                        '$slice': ['$message_ids', 1, {'$size': '$message_ids'}]
+                    },  # Skip first occurrence, keep duplicates
+                    'first_seen': 1
+                }
+            }
+        ]
+        
+        duplicates = []
+        async for doc in self.file_ids.aggregate(pipeline):
+            duplicates.extend(doc['message_ids'])
+            
+        return duplicates
+
+    async def get_file_statistics(self, user_id, chat_id):
+        """Get statistics about stored files"""
+        total_files = await self.file_ids.count_documents({
+            'user_id': user_id, 
+            'chat_id': chat_id
+        })
+        
+        pipeline = [
+            {
+                '$match': {
+                    'user_id': user_id,
+                    'chat_id': chat_id
+                }
+            },
+            {
+                '$group': {
+                    '_id': '$file_id',
+                    'count': {'$sum': 1}
+                }
+            },
+            {
+                '$group': {
+                    '_id': None,
+                    'unique_files': {'$sum': 1},
+                    'duplicate_files': {
+                        '$sum': {
+                            '$cond': [{'$gt': ['$count', 1]}, 1, 0]
+                        }
+                    },
+                    'total_duplicates': {
+                        '$sum': {
+                            '$cond': [{'$gt': ['$count', 1]}, {'$subtract': ['$count', 1]}, 0]
+                        }
+                    }
+                }
+            }
+        ]
+        
+        stats = await self.file_ids.aggregate(pipeline).to_list(length=1)
+        
+        if stats:
+            return {
+                'total_files': total_files,
+                'unique_files': stats[0]['unique_files'],
+                'duplicate_files': stats[0]['duplicate_files'],
+                'total_duplicates': stats[0]['total_duplicates']
+            }
+        else:
+            return {
+                'total_files': 0,
+                'unique_files': 0,
+                'duplicate_files': 0,
+                'total_duplicates': 0
+            }
+
+    async def create_file_indexes(self):
+        """Create indexes for better performance"""
+        try:
+            # Compound index for fast duplicate checking
+            await self.file_ids.create_index([
+                ('user_id', 1),
+                ('chat_id', 1), 
+                ('file_id', 1)
+            ], unique=True)
+            
+            # Index for cleanup operations
+            await self.file_ids.create_index([('timestamp', 1)])
+            
+            print("✅ File ID indexes created successfully")
+        except Exception as e:
+            print(f"⚠️ Index creation warning: {e}")
+
+# Initialize database and create indexes
 db = Db(Config.DATABASE_URI, Config.DATABASE_NAME)
+
+# Create indexes on startup (optional - you can call this manually)
+async def initialize_database():
+    try:
+        await db.create_file_indexes()
+    except Exception as e:
+        print(f"Database initialization note: {e}")
+
+#     ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
+#     💜 𝗖𝗛𝗔𝗡𝗡𝗘𝗟𝗦 𝗙𝗢𝗥 𝗨𝗣𝗗𝗔𝗧𝗘𝗦 💜
+#     Tᘜ Oᗯᑎᗴᖇ : https://t.me/TonyStark_Botz
+#     Tᘜ ᑕOᗰᗰᑌᑎITY : https://t.me/Kanus_Network
+#     ᘜITᕼᑌᗻ Iᗪ : https://github.com/TonyStark-Botz
+#     BY : Kᴀɴᴜs Nᴇᴛᴡᴏʀᴋ™
+#     ▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬
